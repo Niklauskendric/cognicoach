@@ -1,0 +1,80 @@
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║         COGNICOACH — DAY 12 — litellm_config.yaml                ║
+# ║                                                                    ║
+# ║  LiteLLM proxy config — a single local gateway that every node    ║
+# ║  (planner, evaluator, critic) calls through, instead of hitting   ║
+# ║  Groq directly.                                                    ║
+# ║                                                                    ║
+# ║  WHY A GATEWAY WHEN THERE'S ONLY ONE PROVIDER (GROQ)?             ║
+# ║  Even with a single provider, a gateway buys you three things     ║
+# ║  that matter for a production-shaped project:                    ║
+# ║    1. FALLBACK — if llama-3.3-70b-versatile rate-limits or        ║
+# ║       errors, the proxy automatically retries on the smaller/     ║
+# ║       faster llama-3.1-8b-instant instead of the whole request    ║
+# ║       failing.                                                     ║
+# ║    2. ONE PLACE FOR THE REAL KEY — your actual GROQ_API_KEY       ║
+# ║       lives only here, in the proxy's environment. Every node in  ║
+# ║       the graph authenticates to the proxy with a separate,       ║
+# ║       throwaway "virtual key" — so the real key is never spread   ║
+# ║       across your application code.                                ║
+# ║    3. COST + REQUEST LOGGING — the proxy logs every call (model,  ║
+# ║       tokens, latency, cost) centrally, independent of LangSmith. ║
+# ║    4. THIS IS ALSO WHAT MAKES SWAPPING PROVIDERS EASY — if you    ║
+# ║       ever get OpenAI/Anthropic budget later, only this YAML       ║
+# ║       changes. main.py never has to know or care.                  ║
+# ║                                                                    ║
+# ║  GET A GROQ KEY (free): https://console.groq.com/keys             ║
+# ║                                                                    ║
+# ║  RUN THE GATEWAY:                                                  ║
+# ║    litellm --config litellm_config.yaml --port 4000               ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+model_list:
+  # This is the model name your app code will ask for.
+  # LiteLLM maps it to the REAL Groq model + key underneath.
+  - model_name: cognicoach-primary
+    litellm_params:
+      model: groq/llama-3.3-70b-versatile
+      api_key: os.environ/GROQ_API_KEY
+      temperature: 0.3
+
+  # Automatic fallback target if the primary model errors or rate-limits.
+  - model_name: cognicoach-fallback
+    litellm_params:
+      model: groq/llama-3.1-8b-instant
+      api_key: os.environ/GROQ_API_KEY
+      temperature: 0.3
+
+  # Separate low-temperature route for the evaluator — it needs strict,
+  # low-variance scoring, not creative follow-up questions.
+  - model_name: cognicoach-evaluator
+    litellm_params:
+      model: groq/llama-3.3-70b-versatile
+      api_key: os.environ/GROQ_API_KEY
+      temperature: 0.1
+
+litellm_settings:
+  drop_params: true          # silently drop provider-unsupported params instead of erroring
+  set_verbose: false
+
+router_settings:
+  # If a call to cognicoach-primary fails, retry once automatically
+  # against cognicoach-fallback before surfacing an error to the graph.
+  fallbacks:
+    - cognicoach-primary: ["cognicoach-fallback"]
+  num_retries: 1
+  timeout: 30
+
+general_settings:
+  # Master key the FastAPI app authenticates with. Set a real secret
+  # in production via LITELLM_MASTER_KEY env var — do not hardcode.
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+# ══════════════════════════════════════════════════════════════════
+# WHY OPENAI_API_KEY STILL EXISTS IN YOUR .env (unrelated to this file)
+# ══════════════════════════════════════════════════════════════════
+# This gateway routes 100% of CHAT/COMPLETION calls (planner, evaluator,
+# critic) through Groq. Pinecone (Day 11) uses local sentence-transformers
+# for embeddings, not OpenAI — so this project has zero OpenAI usage
+# anywhere. If you don't have an OPENAI_API_KEY in .env at all, that's
+# correct and expected.

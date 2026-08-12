@@ -1,0 +1,69 @@
+# ══════════════════════════════════════════════════════════════════
+# CogniCoach — Backend Requirements (consolidated, Days 1-20)
+# Install: pip install -r requirements.txt
+# Make sure your venv is active first.
+#
+# NOTE ON PROVIDERS: Groq's chat API is OpenAI-compatible, so
+# langchain-openai talks to Groq by pointing base_url at
+# https://api.groq.com/openai/v1 with a GROQ_API_KEY. Whisper
+# transcription (Day 14) is a separate API surface with no
+# OpenAI-compatible shim, so it uses the native `groq` SDK instead —
+# both need to be installed.
+#
+# NOTE ON EMBEDDINGS: Pinecone (Day 11) uses local sentence-transformers
+# embeddings (384-dim), NOT OpenAI embeddings — this project has no
+# OpenAI usage anywhere. If you don't have an OPENAI_API_KEY in .env,
+# that's correct and expected (guardrails_client.py mirrors your
+# GROQ_API_KEY into OPENAI_API_KEY in-process for NeMo only — see
+# backend/safety/guardrails_client.py).
+# ══════════════════════════════════════════════════════════════════
+
+# ── Core LangGraph + LangChain ──
+langgraph==0.2.28
+langchain==0.3.7
+langchain-openai==0.2.8
+langchain-core==0.3.17
+langchain-community==0.3.7
+
+# ── openai SDK — required by langchain-openai's ChatOpenAI wrapper,
+#    even though every call is actually routed to Groq ──
+openai==1.54.4
+
+# ── groq — native SDK, used ONLY for Whisper transcription
+#    (backend/voice/voice_client.py). Chat calls go through
+#    langchain-openai above, not this package. ──
+groq==0.11.0
+
+# ── FastAPI backend ──
+fastapi==0.115.4
+uvicorn[standard]==0.32.0
+python-multipart==0.0.12   # required for POST /session/answer/voice's file upload
+
+# ── Data validation ──
+pydantic==2.9.2
+pydantic-settings==2.6.1
+
+# ── Neo4j knowledge graph (Day 10) ──
+neo4j==5.26.0
+
+# ── Pinecone vector store (Day 11) ──
+pinecone==5.3.1
+sentence-transformers==3.2.1   # local embeddings, 384-dim — see note above
+
+# ── NeMo Guardrails (Day 13) ──
+nemoguardrails==0.11.1
+
+# ── LiteLLM gateway (Day 12) — the `litellm` CLI itself, run as its
+#    own process: `litellm --config litellm_config.yaml --port 4000` ──
+litellm==1.52.9
+
+# ── LangSmith observability (Day 12, optional — controlled by
+#    LANGCHAIN_TRACING_V2 in .env) ──
+langsmith==0.1.143
+
+# ── Environment variables ──
+python-dotenv==1.0.1
+
+# ── HTTP client ──
+httpx==0.24.1
+requests==2.32.3   # used by test_integration.py / test_edge_cases.py

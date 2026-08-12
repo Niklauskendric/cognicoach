@@ -1,0 +1,800 @@
+"""
+╔══════════════════════════════════════════════════════════════════╗
+║   COGNICOACH — FINAL CONSOLIDATED — backend/api/main.py           ║
+║   (Days 1-20 merged into one runnable project)                    ║
+║                                                                    ║
+║  Everything from Days 9-14, PLUS:                                 ║
+║    ✅ LangSmith tracing (Day 12)                                   ║
+║    ✅ LiteLLM gateway (Day 12)                                     ║
+║    ✅ Real Neo4j + Pinecone (Day 10/11)                            ║
+║    ✅ Real Groq Whisper voice (Day 14)                             ║
+║    ✅ ★ FIX — NeMo Guardrails (Day 13) is now actually WIRED IN.   ║
+║       Days 9-14's main.py never called guardrails at all — only   ║
+║       the terminal scripts (day13_graph.py / day14_graph.py) did. ║
+║       evaluator_node and critic_node now run the exact same       ║
+║       input/output checks the terminal scripts always had, so the ║
+║       live API has the same safety behaviour you already tested.  ║
+║    ✅ Weak topics router (Day 18)                                  ║
+║    ✅ History router (Day 19)                                      ║
+║    ✅ Streaming router (Day 20)                                    ║
+║                                                                    ║
+║  RUN (needs the LiteLLM proxy running first — see README):        ║
+║    litellm --config litellm_config.yaml --port 4000   (terminal 1)║
+║    uvicorn backend.api.main:app --reload --port 8000  (terminal 2)║
+║    cd frontend_streamlit && streamlit run app.py       (terminal 3)║
+╚══════════════════════════════════════════════════════════════════╝
+"""
+
+import os
+import uuid
+import time
+import logging
+import tempfile
+from pathlib import Path
+from contextlib import asynccontextmanager
+from typing import Annotated, Literal
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, model_validator
+
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import Command
+
+from backend.memory.neo4j_client import get_neo4j_client
+from backend.memory.pinecone_client import get_pinecone_memory
+from backend.voice.voice_client import get_voice_client
+from backend.safety.guardrails_client import get_guardrails_client   # ★ NEW — now actually used
+from backend.api.weak_topics_router import weak_topics_router        # ★ NEW — Day 18
+from backend.api.history_router import history_router                # ★ NEW — Day 19
+from backend.api.streaming_router import streaming_router            # ★ NEW — Day 20
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("cognicoach")
+
+
+# ════════════════════════════════════════════════════════════════
+# LANGSMITH TRACING
+# ════════════════════════════════════════════════════════════════
+LANGSMITH_ENABLED = os.environ.get("LANGCHAIN_TRACING_V2", "false").lower() == "true"
+if LANGSMITH_ENABLED:
+    os.environ.setdefault("LANGCHAIN_PROJECT", "cognicoach")
+    logger.info(
+        f"[langsmith] Tracing ENABLED — project="
+        f"'{os.environ.get('LANGCHAIN_PROJECT')}'. "
+        f"View traces at https://smith.langchain.com"
+    )
+else:
+    logger.warning(
+        "[langsmith] Tracing DISABLED — set LANGCHAIN_TRACING_V2=true "
+        "in .env to see node-by-node traces in LangSmith."
+    )
+
+
+# ════════════════════════════════════════════════════════════════
+# LITELLM GATEWAY (Groq underneath)
+# ════════════════════════════════════════════════════════════════
+LITELLM_PROXY_URL   = os.environ.get("LITELLM_PROXY_URL", "http://localhost:4000")
+LITELLM_VIRTUAL_KEY = os.environ.get("LITELLM_MASTER_KEY", "sk-cognicoach-local")
+GATEWAY_ENABLED     = os.environ.get("USE_LITELLM_GATEWAY", "true").lower() == "true"
+
+
+def _make_llm(model_alias: str, temperature: float):
+    if GATEWAY_ENABLED:
+        return ChatOpenAI(
+            model=model_alias,
+            temperature=temperature,
+            api_key=LITELLM_VIRTUAL_KEY,
+            base_url=LITELLM_PROXY_URL,
+        )
+    logger.warning(
+        "[litellm] USE_LITELLM_GATEWAY=false — calling Groq directly, "
+        "bypassing the gateway. Fine for debugging, not for the demo."
+    )
+    return ChatOpenAI(
+        model="llama-3.3-70b-versatile",
+        temperature=temperature,
+        api_key=os.environ["GROQ_API_KEY"],
+        base_url="https://api.groq.com/openai/v1",
+    )
+
+
+# ════════════════════════════════════════════════════════════════
+# PYDANTIC MODELS
+# ════════════════════════════════════════════════════════════════
+
+class EvalRubric(BaseModel):
+    depth_score: float = Field(..., ge=0, le=10)
+    accuracy_score: float = Field(..., ge=0, le=10)
+    communication_score: float = Field(..., ge=0, le=10)
+    overall_score: float = Field(..., ge=0, le=10)
+    feedback: str = Field(...)
+    weak_topics: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def recompute_overall(self) -> "EvalRubric":
+        self.overall_score = round(
+            (self.depth_score + self.accuracy_score + self.communication_score) / 3, 2
+        )
+        return self
+
+
+class QuestionPlan(BaseModel):
+    questions: list[str] = Field(..., min_length=5, max_length=5)
+    focus_topics: list[str] = Field(default_factory=list)
+    difficulty: Literal["easy", "medium", "hard"] = "medium"
+
+
+class CogniCoachState(BaseModel):
+    messages: Annotated[list, add_messages] = Field(default_factory=list)
+    user_id: str = "anonymous"
+    session_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    question_plan: QuestionPlan | None = None
+    current_question: str = ""
+    question_index: int = 0
+    user_answer: str = ""
+    rubric: EvalRubric | None = None
+    needs_followup: bool = False
+    followup_question: str = ""
+    retry_count: int = 0
+    max_retries: int = 2
+    graph_updated: bool = False
+    session_complete: bool = False
+    session_history: list[dict] = Field(default_factory=list)
+    all_weak_topics: list[str] = Field(default_factory=list)
+    retrieved_context: list[dict] = Field(default_factory=list)
+    audio_file_path: str = ""          # set via resume for voice input
+    transcription_used: bool = False   # True if this answer came via Whisper
+    input_blocked: bool = False        # ★ NEW — True if guardrails blocked this answer
+
+
+class StartSessionRequest(BaseModel):
+    user_id: str = "anonymous"
+
+
+class StartSessionResponse(BaseModel):
+    thread_id: str
+    question: str
+    question_index: int
+    total_questions: int
+    focus_topics: list[str]
+    difficulty: str
+    used_past_context: bool
+
+
+class AnswerRequest(BaseModel):
+    thread_id: str
+    answer: str = Field(..., min_length=1)
+
+
+# ★ NEW — /session/answer/voice takes multipart form fields instead of
+# JSON (thread_id as a Form field, audio as an UploadFile) — there's no
+# equivalent Pydantic request model for a multipart endpoint, FastAPI
+# reads those two params directly off the request.
+
+
+class RubricOut(BaseModel):
+    overall_score: float
+    depth_score: float
+    accuracy_score: float
+    communication_score: float
+    feedback: str
+    weak_topics: list[str]
+
+
+class AnswerResponse(BaseModel):
+    rubric: RubricOut
+    needs_followup: bool
+    retry_count: int
+    next_question: str | None
+    question_index: int
+    session_complete: bool
+    transcribed_text: str | None = None   # populated only for voice answers
+    input_blocked: bool = False           # ★ NEW — True if guardrails blocked this answer
+
+
+class StatusResponse(BaseModel):
+    thread_id: str
+    current_question: str
+    question_index: int
+    retry_count: int
+    session_complete: bool
+    total_history: int
+
+
+# ════════════════════════════════════════════════════════════════
+# LLM SETUP — via _make_llm(), routed through LiteLLM → Groq
+# method="function_calling" required on structured output — Groq
+# doesn't support OpenAI's strict json_schema mode.
+# ════════════════════════════════════════════════════════════════
+
+_planner_llm = _make_llm("cognicoach-primary", temperature=0.3).with_structured_output(
+    QuestionPlan, method="function_calling"
+)
+_evaluator_llm = _make_llm("cognicoach-evaluator", temperature=0.1).with_structured_output(
+    EvalRubric, method="function_calling"
+)
+_critic_llm = _make_llm("cognicoach-primary", temperature=0.3)
+
+SCORE_THRESHOLD = 6.0
+
+_FALLBACK_PLAN = QuestionPlan(
+    questions=[
+        "What is the difference between supervised and unsupervised learning?",
+        "Can you explain what overfitting means and how to prevent it?",
+        "How does gradient descent update model weights?",
+        "What is the bias-variance tradeoff?",
+        "How would you choose between L1 and L2 regularisation?",
+    ],
+    focus_topics=["supervised learning", "overfitting", "gradient descent"],
+    difficulty="medium",
+)
+
+
+_PLANNER_PROMPT = """You are an expert AI/ML interview coach.
+Generate EXACTLY 5 interview questions targeting the candidate's weakest topics.
+Rules: Order easiest to hardest. Each answerable in 2-3 sentences.
+Do NOT repeat concepts. Distribute across ALL topics.
+If PAST SESSION CONTEXT is provided below, use it to make questions more
+targeted. Set focus_topics and difficulty appropriately."""
+
+
+def _format_retrieved_context(context: list[dict]) -> str:
+    if not context:
+        return "No past session history available — this may be a new user."
+    lines = ["PAST SESSION CONTEXT (most relevant past exchanges):"]
+    for i, hit in enumerate(context, 1):
+        lines.append(
+            f"{i}. [similarity={hit['score']}] "
+            f"Q: {hit['question']} | Candidate answered: {hit['answer']} | "
+            f"Score was {hit['overall_score']}/10 | Feedback given: {hit['feedback']}"
+        )
+    return "\n".join(lines)
+
+
+def planner_node(state: CogniCoachState) -> dict:
+    logger.info("[planner] Generating session plan (Neo4j + Pinecone + LiteLLM gateway → Groq)...")
+    neo4j = get_neo4j_client()
+    neo4j.ensure_user_exists(state.user_id)
+    weak_topics = neo4j.fetch_weak_topics(state.user_id, limit=3)
+    if not weak_topics:
+        weak_topics = ["backpropagation", "gradient descent", "overfitting"]
+
+    pinecone_memory = get_pinecone_memory()
+    retrieved = pinecone_memory.fetch_relevant_context(
+        user_id=state.user_id, query_topics=weak_topics, top_k=3,
+    )
+    context_block = _format_retrieved_context(retrieved)
+
+    msgs = [
+        SystemMessage(content=_PLANNER_PROMPT),
+        HumanMessage(content=(
+            f"Candidate's weakest topics (from knowledge graph): "
+            f"{', '.join(weak_topics)}\n\n{context_block}"
+        )),
+    ]
+
+    for attempt in range(2):
+        try:
+            plan: QuestionPlan = _planner_llm.invoke(msgs)
+            if all(q.strip() for q in plan.questions):
+                logger.info(f"[planner] {len(plan.questions)} questions | "
+                            f"difficulty={plan.difficulty} | RAG hits={len(retrieved)}")
+                return {
+                    "question_plan": plan,
+                    "current_question": plan.questions[0],
+                    "question_index": 0,
+                    "retrieved_context": retrieved,
+                }
+        except Exception as e:
+            logger.warning(f"[planner] Attempt {attempt+1} failed: {e}")
+            if attempt == 0:
+                time.sleep(1)
+
+    logger.warning("[planner] Using fallback plan")
+    return {
+        "question_plan": _FALLBACK_PLAN,
+        "current_question": _FALLBACK_PLAN.questions[0],
+        "question_index": 0,
+        "retrieved_context": retrieved,
+    }
+
+
+def voice_node(state: CogniCoachState) -> dict:
+    """
+    ★ Real transcription (was a Day 9-12 stub).
+
+    resume={"user_answer": "..."}      → typed, passes through untouched.
+    resume={"audio_file_path": "..."}  → transcribes via Groq Whisper and
+    fills in user_answer. See backend/voice/voice_client.py.
+    """
+    if state.audio_file_path and state.audio_file_path.strip():
+        logger.info("[voice] Transcribing audio via Groq Whisper...")
+        voice_client = get_voice_client()
+        text, error = voice_client.transcribe(state.audio_file_path)
+
+        if error:
+            logger.warning(f"[voice] Transcription failed: {error}")
+            return {"user_answer": "", "transcription_used": False, "audio_file_path": ""}
+
+        logger.info(f"[voice] Transcribed {len(text)} chars")
+        return {"user_answer": text, "transcription_used": True, "audio_file_path": ""}
+
+    return {"transcription_used": False}
+
+
+_EVALUATOR_PROMPT = """You are a strict technical interview evaluator.
+Score on 3 dimensions (0-10 each). Use FULL range — not just 7-9.
+depth_score: Explains WHY and HOW? accuracy_score: factually correct?
+communication_score: clear without extra context?
+Be strict. Average answers deserve 5-6, not 8-9.
+feedback: ONE specific tip. weak_topics: at most 3 sub-topics."""
+
+
+def evaluator_node(state: CogniCoachState) -> dict:
+    logger.info("[evaluator] Checking input safety...")
+
+    if not state.user_answer or not state.user_answer.strip():
+        return {"rubric": EvalRubric(
+            depth_score=0.0, accuracy_score=0.0, communication_score=0.0,
+            overall_score=0.0, feedback="No answer provided.", weak_topics=[],
+        ), "input_blocked": False}
+
+    # ★ FIX — Day 13's guardrails, now actually reached by the API.
+    guardrails = get_guardrails_client()
+    allowed, block_reason = guardrails.check_input(state.user_answer)
+    if not allowed:
+        logger.warning(f"[evaluator] ⛔ Input BLOCKED by guardrails: {block_reason[:70]}")
+        return {
+            "rubric": EvalRubric(
+                depth_score=0.0, accuracy_score=0.0, communication_score=0.0,
+                overall_score=0.0, feedback=block_reason, weak_topics=[],
+            ),
+            "input_blocked": True,
+        }
+
+    logger.info("[evaluator] Input clear. Scoring answer (via gateway → Groq)...")
+    msgs = [
+        SystemMessage(content=_EVALUATOR_PROMPT),
+        HumanMessage(content=f"Question: {state.current_question}\n\nAnswer: {state.user_answer}"),
+    ]
+    rubric = None
+    for attempt in range(2):
+        try:
+            rubric = _evaluator_llm.invoke(msgs)
+            logger.info(f"[evaluator] overall={rubric.overall_score}")
+            break
+        except Exception as e:
+            logger.warning(f"[evaluator] Attempt {attempt+1} failed: {e}")
+            if attempt == 0:
+                time.sleep(1)
+
+    if rubric is None:
+        rubric = EvalRubric(
+            depth_score=5.0, accuracy_score=5.0, communication_score=5.0,
+            overall_score=5.0, feedback="Evaluation temporarily unavailable.", weak_topics=[],
+        )
+
+    ok, safe_feedback = guardrails.check_output(rubric.feedback)
+    if not ok:
+        rubric.feedback = safe_feedback
+
+    return {"rubric": rubric, "input_blocked": False}
+
+
+_CRITIC_PROMPT = """You are an expert interview coach.
+The candidate gave a WEAK answer. Generate ONE targeted follow-up question.
+Target SPECIFIC weak topics. Be NARROWER than original.
+Do NOT re-ask the same question. Return ONLY the follow-up question."""
+
+
+def critic_node(state: CogniCoachState) -> dict:
+    logger.info("[critic] Making decision...")
+    if state.rubric is None:
+        return {"needs_followup": False}
+
+    score = state.rubric.overall_score
+
+    # ★ FIX — a blocked answer should never get a follow-up retry loop;
+    # force advance so the candidate isn't stuck re-answering past a
+    # guardrail that already made its decision.
+    if state.input_blocked:
+        logger.info("[critic] Input was blocked upstream. Forcing advance, not retry.")
+        return {"needs_followup": False, "followup_question": ""}
+
+    if state.retry_count >= state.max_retries:
+        return {"needs_followup": False, "followup_question": ""}
+    if score >= SCORE_THRESHOLD:
+        return {"needs_followup": False, "followup_question": ""}
+
+    weak_str = ", ".join(state.rubric.weak_topics) if state.rubric.weak_topics else "the core concept"
+    msgs = [
+        SystemMessage(content=_CRITIC_PROMPT),
+        HumanMessage(content=(
+            f"Original question: {state.current_question}\n\n"
+            f"Weak answer: {state.user_answer}\n\n"
+            f"Score: {score}/10 | Weak areas: {weak_str}\n"
+            f"Feedback: {state.rubric.feedback}"
+        )),
+    ]
+    followup = ""
+    for attempt in range(2):
+        try:
+            resp = _critic_llm.invoke(msgs)
+            followup = resp.content.strip()
+            if followup:
+                break
+        except Exception as e:
+            logger.warning(f"[critic] Follow-up attempt {attempt+1} failed: {e}")
+            if attempt == 0:
+                time.sleep(1)
+    if not followup:
+        wt = state.rubric.weak_topics
+        followup = f"Can you explain the role of {wt[0] if wt else 'this concept'} in more technical detail?"
+
+    # ★ FIX — output-check the follow-up question too, same as the
+    # terminal script always did.
+    guardrails = get_guardrails_client()
+    ok, safe_followup = guardrails.check_output(followup)
+    if not ok:
+        followup = safe_followup
+
+    return {
+        "needs_followup": True,
+        "followup_question": followup,
+        "current_question": followup,
+        "retry_count": state.retry_count + 1,
+        "user_answer": "",
+        "rubric": None,
+    }
+
+
+def graph_updater_node(state: CogniCoachState) -> dict:
+    logger.info("[graph_updater] Recording result (Neo4j + Pinecone writes)...")
+    r = state.rubric
+    entry = {
+        "question_index": state.question_index,
+        "question": state.current_question,
+        "final_answer": state.user_answer,
+        "overall_score": r.overall_score if r else 0.0,
+        "depth_score": r.depth_score if r else 0.0,
+        "accuracy_score": r.accuracy_score if r else 0.0,
+        "communication_score": r.communication_score if r else 0.0,
+        "feedback": r.feedback if r else "",
+        "weak_topics": r.weak_topics if r else [],
+        "retries_used": state.retry_count,
+        "input_blocked": state.input_blocked,     # ★ NEW
+        "via_voice": state.transcription_used,
+    }
+
+    neo4j = get_neo4j_client()
+    pinecone_memory = get_pinecone_memory()
+
+    # ★ FIX — a blocked answer never reaches Neo4j/Pinecone. Writing a
+    # guardrails-refusal message into topic scores or Q&A memory would
+    # poison future planning/RAG context with junk that was never a
+    # real technical answer.
+    if r and r.weak_topics and not state.input_blocked:
+        for topic in r.weak_topics:
+            neo4j.update_topic_scores(user_id=state.user_id, topic_name=topic, session_score=r.overall_score)
+
+    if r and not state.input_blocked:
+        pinecone_memory.store_qa_memory(
+            user_id=state.user_id, session_id=state.session_id,
+            question=state.current_question, answer=state.user_answer,
+            feedback=r.feedback, overall_score=r.overall_score, weak_topics=r.weak_topics,
+        )
+
+    plan = state.question_plan
+    next_index = state.question_index + 1
+
+    if plan and next_index < len(plan.questions):
+        new_weak = state.all_weak_topics + (entry.get("weak_topics", []) if not state.input_blocked else [])
+        return {
+            "graph_updated": True,
+            "question_index": next_index,
+            "current_question": plan.questions[next_index],
+            "session_history": state.session_history + [entry],
+            "all_weak_topics": new_weak,
+            "user_answer": "",
+            "rubric": None,
+            "needs_followup": False,
+            "followup_question": "",
+            "retry_count": 0,
+            "audio_file_path": "",
+            "transcription_used": False,
+            "input_blocked": False,
+        }
+
+    seen, deduped = set(), []
+    for t in state.all_weak_topics + (entry.get("weak_topics", []) if not state.input_blocked else []):
+        if t.lower() not in seen:
+            seen.add(t.lower())
+            deduped.append(t)
+
+    full_history = state.session_history + [entry]
+    avg_score = sum(e["overall_score"] for e in full_history) / len(full_history) if full_history else 0.0
+
+    neo4j.save_session(
+        user_id=state.user_id, session_id=state.session_id,
+        avg_score=round(avg_score, 2), total_questions=len(full_history), weak_topics=deduped,
+    )
+    pinecone_memory.store_session_summary(
+        user_id=state.user_id, session_id=state.session_id,
+        avg_score=round(avg_score, 2), weak_topics=deduped, num_questions=len(full_history),
+    )
+
+    return {
+        "graph_updated": True,
+        "session_complete": True,
+        "session_history": full_history,
+        "all_weak_topics": deduped,
+    }
+
+
+def route_after_critic(state: CogniCoachState) -> Literal["evaluator", "graph_updater", "__end__"]:
+    if state.session_complete:
+        return END
+    if state.needs_followup:
+        return "evaluator"
+    return "graph_updater"
+
+
+def build_cognicoach_graph():
+    builder = StateGraph(CogniCoachState)
+    builder.add_node("planner", planner_node)
+    builder.add_node("voice", voice_node)
+    builder.add_node("evaluator", evaluator_node)
+    builder.add_node("critic", critic_node)
+    builder.add_node("graph_updater", graph_updater_node)
+
+    builder.add_edge(START, "planner")
+    builder.add_edge("planner", "voice")
+    builder.add_edge("voice", "evaluator")
+    builder.add_edge("evaluator", "critic")
+    builder.add_edge("graph_updater", "voice")
+
+    builder.add_conditional_edges(
+        "critic", route_after_critic,
+        {"evaluator": "evaluator", "graph_updater": "graph_updater", END: END}
+    )
+
+    graph = builder.compile(checkpointer=MemorySaver(), interrupt_before=["voice"])
+    logger.info("Graph compiled successfully ✅")
+    return graph
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Building CogniCoach graph...")
+    app.state.graph = build_cognicoach_graph()
+    logger.info("Server ready ✅")
+    yield
+    logger.info("Server shutting down.")
+
+
+app = FastAPI(
+    title="CogniCoach API",
+    description="Adaptive multi-agent AI interview coaching system",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:8501",
+        "http://127.0.0.1:8501",
+        "https://*.streamlit.app",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+app.include_router(weak_topics_router)   # ★ Day 18
+app.include_router(history_router)       # ★ Day 19
+app.include_router(streaming_router)     # ★ Day 20
+
+
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "graph_ready": hasattr(app.state, "graph"),
+        "version": "1.0.0",   # ★ consolidated — Days 1-20
+        "langsmith_tracing_enabled": LANGSMITH_ENABLED,
+        "litellm_gateway_enabled": GATEWAY_ENABLED,
+        "litellm_proxy_url": LITELLM_PROXY_URL if GATEWAY_ENABLED else None,
+        "guardrails_enabled": True,   # ★ NEW — now actually wired into evaluator/critic
+    }
+
+
+@app.post("/session/start", response_model=StartSessionResponse)
+async def start_session(request: StartSessionRequest):
+    graph = app.state.graph
+    thread_id = str(uuid.uuid4())
+    config = {"configurable": {"thread_id": thread_id}}
+
+    try:
+        state = graph.invoke(CogniCoachState(user_id=request.user_id), config=config)
+    except Exception as e:
+        logger.error(f"[/session/start] Graph error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to start session: {str(e)}")
+
+    plan = state.get("question_plan")
+    if not plan:
+        raise HTTPException(status_code=500, detail="Planner failed to generate questions")
+
+    return StartSessionResponse(
+        thread_id=thread_id,
+        question=state.get("current_question", ""),
+        question_index=state.get("question_index", 0),
+        total_questions=len(plan.questions),
+        focus_topics=plan.focus_topics,
+        difficulty=plan.difficulty,
+        used_past_context=len(state.get("retrieved_context", [])) > 0,
+    )
+
+
+@app.post("/session/answer", response_model=AnswerResponse)
+async def submit_answer(request: AnswerRequest):
+    graph = app.state.graph
+    config = {"configurable": {"thread_id": request.thread_id}}
+
+    try:
+        checkpoint = graph.checkpointer.get(config)
+        if checkpoint is None:
+            raise HTTPException(status_code=404, detail=f"Session '{request.thread_id}' not found.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        # ★ Day 27 fix — previously a bare `except Exception: pass` here
+        # silently swallowed any unexpected checkpoint-lookup failure and
+        # fell through to graph.invoke() anyway, which could start a
+        # confusing fresh run instead of surfacing the real problem.
+        logger.error(f"[/session/answer] Unexpected checkpoint lookup error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to look up session: {e}")
+
+    try:
+        state = graph.invoke(Command(resume={"user_answer": request.answer}), config=config)
+    except Exception as e:
+        logger.error(f"[/session/answer] Graph error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to process answer: {str(e)}")
+
+    rubric = state.get("rubric")
+    if rubric is None:
+        raise HTTPException(status_code=500, detail="Evaluator did not return a rubric")
+
+    session_complete = state.get("session_complete", False)
+    needs_followup = state.get("needs_followup", False)
+    next_question = None if session_complete else state.get("current_question", "")
+
+    return AnswerResponse(
+        rubric=RubricOut(
+            overall_score=rubric.overall_score,
+            depth_score=rubric.depth_score,
+            accuracy_score=rubric.accuracy_score,
+            communication_score=rubric.communication_score,
+            feedback=rubric.feedback,
+            weak_topics=rubric.weak_topics,
+        ),
+        needs_followup=needs_followup,
+        retry_count=state.get("retry_count", 0),
+        next_question=next_question,
+        question_index=state.get("question_index", 0),
+        session_complete=session_complete,
+        input_blocked=state.get("input_blocked", False),
+    )
+
+
+@app.post("/session/answer/voice", response_model=AnswerResponse)
+async def submit_voice_answer(thread_id: str = Form(...), audio: UploadFile = File(...)):
+    """
+    ★ NEW — Day 14. Same contract as /session/answer, but the candidate's
+    answer arrives as an audio file instead of text.
+
+    What happens:
+      1. Verifies the session exists (same check as /session/answer)
+      2. Saves the uploaded file to a temp path
+      3. Resumes the graph with resume={"audio_file_path": tmp_path} —
+         voice_node (not this endpoint) does the actual Groq Whisper
+         call, so transcription logic lives in exactly one place
+         whether you're running day14_graph.py in a terminal or hitting
+         this endpoint from Streamlit (Day 16)
+      4. Deletes the temp file once the graph has read it
+      5. If transcription failed, returns a rubric of 0/10 with the
+         failure reason as feedback (same shape as a real answer, so
+         the frontend doesn't need a separate error branch) and
+         transcribed_text=None so the UI knows to prompt a retry
+    """
+    graph = app.state.graph
+    config = {"configurable": {"thread_id": thread_id}}
+
+    try:
+        checkpoint = graph.checkpointer.get(config)
+        if checkpoint is None:
+            raise HTTPException(status_code=404, detail=f"Session '{thread_id}' not found.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        # ★ Day 27 fix — same issue as /session/answer above.
+        logger.error(f"[/session/answer/voice] Unexpected checkpoint lookup error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to look up session: {e}")
+
+    suffix = Path(audio.filename or "answer.wav").suffix or ".wav"
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(await audio.read())
+            tmp_path = tmp.name
+
+        state = graph.invoke(Command(resume={"audio_file_path": tmp_path}), config=config)
+    except Exception as e:
+        logger.error(f"[/session/answer/voice] Graph error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to process voice answer: {str(e)}")
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    rubric = state.get("rubric")
+    if rubric is None:
+        raise HTTPException(status_code=500, detail="Evaluator did not return a rubric")
+
+    session_complete = state.get("session_complete", False)
+    needs_followup = state.get("needs_followup", False)
+    next_question = None if session_complete else state.get("current_question", "")
+    transcribed = state.get("user_answer", "") if state.get("transcription_used") else None
+
+    return AnswerResponse(
+        rubric=RubricOut(
+            overall_score=rubric.overall_score,
+            depth_score=rubric.depth_score,
+            accuracy_score=rubric.accuracy_score,
+            communication_score=rubric.communication_score,
+            feedback=rubric.feedback,
+            weak_topics=rubric.weak_topics,
+        ),
+        needs_followup=needs_followup,
+        retry_count=state.get("retry_count", 0),
+        next_question=next_question,
+        question_index=state.get("question_index", 0),
+        session_complete=session_complete,
+        transcribed_text=transcribed,
+        input_blocked=state.get("input_blocked", False),
+    )
+
+
+@app.get("/session/status/{thread_id}", response_model=StatusResponse)
+async def get_session_status(thread_id: str):
+    graph = app.state.graph
+    config = {"configurable": {"thread_id": thread_id}}
+
+    try:
+        snapshot = graph.get_state(config)
+        if snapshot is None or snapshot.values is None:
+            raise HTTPException(status_code=404, detail=f"Session '{thread_id}' not found.")
+        values = snapshot.values
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Session not found: {str(e)}")
+
+    return StatusResponse(
+        thread_id=thread_id,
+        current_question=values.get("current_question", ""),
+        question_index=values.get("question_index", 0),
+        retry_count=values.get("retry_count", 0),
+        session_complete=values.get("session_complete", False),
+        total_history=len(values.get("session_history", [])),
+    )

@@ -65,5 +65,5 @@ langsmith==0.1.143
 python-dotenv==1.0.1
 
 # ── HTTP client ──
-httpx==0.24.1
+httpx>=0.25.2
 requests==2.32.3   # used by test_integration.py / test_edge_cases.py

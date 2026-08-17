@@ -51,7 +51,7 @@ pinecone==5.3.1
 sentence-transformers==3.2.1   # local embeddings, 384-dim — see note above
 
 # ── NeMo Guardrails (Day 13) ──
-nemoguardrails==0.11.1
+nemoguardrails==0.13.0
 
 # ── LiteLLM gateway (Day 12) — the `litellm` CLI itself, run as its
 #    own process: `litellm --config litellm_config.yaml --port 4000` ──
